@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import ast
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
+import os
+
+myname = "sid"
 
 
 def get_2digits(num):
