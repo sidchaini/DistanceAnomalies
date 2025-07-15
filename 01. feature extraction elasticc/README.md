@@ -1,0 +1,1 @@
+Here I'm using ALeRCe's LC-Classifier's feature extraction method to get features from the light curves!
