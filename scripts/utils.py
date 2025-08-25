@@ -5,6 +5,13 @@ import ast
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import os
+from tqdm.auto import tqdm
+import distclassipy as dcpy
+
+from mlxtend.feature_selection import (
+    SequentialFeatureSelector,
+    ExhaustiveFeatureSelector as EFS,
+)
 
 myname = "sid"
 
@@ -240,3 +247,137 @@ def plot_cm(y_true, y_pred, annot_fmt="pn", label_strings=None):
     # plt.yticks(rotation=45)
 
     return ax
+
+def remove_correlated_features(features_df, class_df, corr_thresh=0.9, rebalance=True):
+    assert (features_df.index == class_df.index).all()
+    assert features_df.index.name == class_df.index.name
+    
+    print("Calculating correlations...")
+    corr_matrix = features_df.corr()
+    print("Done!")
+
+    corr_matrix = corr_matrix.abs()
+    
+    
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype("bool"))
+    upper = upper[upper >= corr_thresh].dropna(axis=1, how="all")
+    upper = upper.sort_values(by=list(upper.columns), ascending=False)
+    
+    lists = []
+    
+    for idx in upper.index:
+        row = upper.loc[idx].dropna()
+        ls = sorted(list(row.index) + [row.name])
+        lists.append(ls)
+    
+    # lists = [[1, 3], [3, 5], [5, 6], [7, 8]]
+    merged = []
+    for lst in lists:
+        for m in merged:
+            if any(item in m for item in lst):
+                m.extend(lst)
+                break
+        else:
+            merged.append(lst)
+    
+    merged_alt = []
+    for m in merged:
+        merged_alt.append(list(set(m)))
+    merged = merged_alt
+    # print(merged)
+    
+    choose_corrfeats = []
+    for m in merged:
+        features_df[m].isna()
+        argmin_feat = features_df[m].isna().sum().argmin()
+        feat_chosen = m[argmin_feat]
+        choose_corrfeats.append(feat_chosen)
+    
+    bigset = []
+    for m in merged:
+        if len(m) > 1:
+            bigset.append(m)
+    bigset = [item for subset in bigset for item in subset]
+    
+    drop_corrfeats = list(set(bigset) - set(choose_corrfeats))
+    
+    smallfeatures = features_df.loc[:, choose_corrfeats].dropna(axis=1)
+    # drop duplicated cols
+    smallfeatures = smallfeatures.loc[:, ~smallfeatures.columns.duplicated()].copy()
+
+    if rebalance:
+        class_df = class_df.loc[smallfeatures.index]
+        new_n = class_df.groupby(class_df).count().min()
+        class_df=class_df.groupby(class_df).sample(new_n)
+        smallfeatures = smallfeatures.loc[class_df.index]
+    return smallfeatures, class_df
+
+def get_lcdc_features(X_df, y_df, all_metrics, k_features=10):
+    scoring = "f1_macro"
+
+    good_feats = []
+
+    metric_maxscore = {"metric":[],"max_score":[]}
+    
+    for metric in tqdm(all_metrics, desc="SFS", leave=True):
+        # Sequential Feature Selection 1-31 features
+        lcdc = dcpy.DistanceMetricClassifier(
+            scale=True,
+            central_stat="median",
+            dispersion_stat="std",
+            metric=metric,
+        )
+
+        feat_selector = SequentialFeatureSelector(
+            lcdc,
+            k_features=k_features,
+            scoring=scoring,
+            forward=True,
+            n_jobs=-1,
+            verbose=0,
+        ).fit(X_df, y_df)
+
+        sfs_df = pd.DataFrame.from_dict(feat_selector.get_metric_dict()).T
+        sfs_df.index.name = "num_feats"
+        sfs_df["avg_score"] = sfs_df["avg_score"].astype("float")
+        sfs_df = sfs_df.sort_values(by="avg_score", ascending=False)
+
+        # load_best_features()
+        idx_maxscore = sfs_df["avg_score"].idxmax()
+        max_score = sfs_df.loc[idx_maxscore, "avg_score"]
+        max_score_std = sfs_df.loc[idx_maxscore, "std_dev"]
+        sfs_df = sfs_df.loc[(sfs_df["avg_score"]) >= max_score - max_score_std]
+        sfs_df = sfs_df.sort_index()
+        feats = list(sfs_df.iloc[0]["feature_names"])
+        
+        metric_maxscore["metric"].append(metric)
+        metric_maxscore["max_score"].append(max_score)
+
+        good_feats = good_feats + feats
+
+    topfeats = pd.Series(np.array(good_feats))
+
+    superset_feats = topfeats.value_counts().iloc[:k_features].index
+
+    X_df = X_df.loc[:, superset_feats]
+
+    metric_maxscore = pd.DataFrame(metric_maxscore)
+
+    for metric in tqdm([metric_maxscore.iloc[metric_maxscore["max_score"].argmax()]["metric"]], desc="EFS", leave=False):
+        lcdc = dcpy.DistanceMetricClassifier(
+            scale=True,
+            central_stat="median",
+            dispersion_stat="std",
+            metric=metric,
+        )
+
+        feat_selector = EFS(
+            lcdc,
+            min_features=1,
+            max_features=len(superset_feats),
+            scoring=scoring,
+            print_progress=False,
+            n_jobs=-1,
+        ).fit(X_df, y_df)
+        
+        return sorted(list(feat_selector.best_feature_names_))
